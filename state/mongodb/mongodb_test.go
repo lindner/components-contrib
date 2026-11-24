@@ -22,11 +22,13 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo/integration/mtest"
 	"go.uber.org/goleak"
 
 	"github.com/dapr/components-contrib/metadata"
 	"github.com/dapr/components-contrib/state"
 	"github.com/dapr/kit/logger"
+	"github.com/dapr/kit/ptr"
 )
 
 func TestGetMongoDBMetadata(t *testing.T) {
@@ -393,5 +395,198 @@ func TestGoroutineLeak(t *testing.T) {
 		require.True(t, ok)
 		err := closer.Close()
 		require.NoError(t, err)
+	})
+}
+
+func TestETagWrites(t *testing.T) {
+	mt := mtest.New(t, mtest.NewOptions().ClientType(mtest.Mock))
+
+	newStore := func(mt *mtest.T) *MongoDB {
+		return &MongoDB{
+			client:       mt.Client,
+			collection:   mt.Coll,
+			logger:       logger.NewLogger("test"),
+			isReplicaSet: true,
+		}
+	}
+
+	ttlFilter := getFilterTTL()[0]
+
+	mt.Run("set with etag on missing key creates it", func(mt *mtest.T) {
+		mt.AddMockResponses(
+			mtest.CreateSuccessResponse(bson.E{Key: "n", Value: 0}, bson.E{Key: "nModified", Value: 0}),
+			mtest.CreateSuccessResponse(bson.E{Key: "n", Value: 1}, bson.E{Key: "nModified", Value: 0}),
+		)
+
+		require.NoError(mt, newStore(mt).Set(mt.Context(), &state.SetRequest{Key: "k", Value: "v", ETag: ptr.Of("e")}))
+
+		events := mt.GetAllStartedEvents()
+		require.Len(mt, events, 2)
+
+		// The etag update skips expired docs and never upserts, MongoDB rejects $expr in an upsert.
+		update := events[0].Command.Lookup("updates").Array().Index(0).Value().Document()
+		upsert, ok := update.Lookup("upsert").BooleanOK()
+		assert.False(mt, ok && upsert)
+		// The filter matches the etag on a live doc, or any expired doc.
+		var q bson.D
+		require.NoError(mt, bson.Unmarshal(update.Lookup("q").Document(), &q))
+		require.Len(mt, q, 2)
+		assert.Equal(mt, bson.E{Key: id, Value: "k"}, q[0])
+		assert.Equal(mt, "$or", q[1].Key)
+		or, ok := q[1].Value.(bson.A)
+		require.True(mt, ok)
+		require.Len(mt, or, 2)
+		assert.Contains(mt, or[0], bson.E{Key: etag, Value: "e"})
+		assert.Equal(mt, ttlFilter.Key, or[0].(bson.D)[1].Key)
+		wantExpired, err := bson.Marshal(getFilterExpired())
+		require.NoError(mt, err)
+		gotExpired, err := bson.Marshal(or[1])
+		require.NoError(mt, err)
+		assert.Equal(mt, wantExpired, gotExpired)
+
+		// No match falls back to an upsert whose etag never matches, so only a missing key is inserted.
+		update = events[1].Command.Lookup("updates").Array().Index(0).Value().Document()
+		assert.True(mt, update.Lookup("upsert").Boolean())
+		q = nil
+		require.NoError(mt, bson.Unmarshal(update.Lookup("q").Document(), &q))
+		require.Len(mt, q, 2)
+		assert.Equal(mt, bson.E{Key: id, Value: "k"}, q[0])
+		assert.Equal(mt, etag, q[1].Key)
+		assert.NotEqual(mt, "e", q[1].Value)
+	})
+
+	mt.Run("set with stale etag on existing key is a mismatch", func(mt *mtest.T) {
+		mt.AddMockResponses(
+			mtest.CreateSuccessResponse(bson.E{Key: "n", Value: 0}, bson.E{Key: "nModified", Value: 0}),
+			mtest.CreateWriteErrorsResponse(mtest.WriteError{Index: 0, Code: 11000, Message: "E11000 duplicate key error"}),
+		)
+
+		err := newStore(mt).Set(mt.Context(), &state.SetRequest{Key: "k", Value: "v", ETag: ptr.Of("e")})
+		var etagErr *state.ETagError
+		require.ErrorAs(mt, err, &etagErr)
+		assert.Equal(mt, state.ETagMismatch, etagErr.Kind())
+	})
+
+	mt.Run("set with matching etag updates once", func(mt *mtest.T) {
+		mt.AddMockResponses(mtest.CreateSuccessResponse(bson.E{Key: "n", Value: 1}, bson.E{Key: "nModified", Value: 1}))
+
+		require.NoError(mt, newStore(mt).Set(mt.Context(), &state.SetRequest{Key: "k", Value: "v", ETag: ptr.Of("e")}))
+		assert.Len(mt, mt.GetAllStartedEvents(), 1)
+	})
+
+	mt.Run("set without etag still upserts", func(mt *mtest.T) {
+		mt.AddMockResponses(mtest.CreateSuccessResponse(bson.E{Key: "n", Value: 1}))
+
+		require.NoError(mt, newStore(mt).Set(mt.Context(), &state.SetRequest{Key: "k", Value: "v"}))
+
+		update := mt.GetStartedEvent().Command.Lookup("updates").Array().Index(0).Value().Document()
+		assert.True(mt, update.Lookup("upsert").Boolean())
+	})
+
+	mt.Run("delete with etag skips expired docs", func(mt *mtest.T) {
+		mt.AddMockResponses(mtest.CreateSuccessResponse(bson.E{Key: "value", Value: nil}))
+
+		err := newStore(mt).Delete(mt.Context(), &state.DeleteRequest{Key: "k", ETag: ptr.Of("e")})
+		var etagErr *state.ETagError
+		require.ErrorAs(mt, err, &etagErr)
+		assert.Equal(mt, state.ETagMismatch, etagErr.Kind())
+
+		started := mt.GetStartedEvent()
+		require.Equal(mt, "findAndModify", started.CommandName)
+		assert.True(mt, started.Command.Lookup("remove").Boolean())
+		var q bson.D
+		require.NoError(mt, bson.Unmarshal(started.Command.Lookup("query").Document(), &q))
+		assert.Contains(mt, q, bson.E{Key: etag, Value: "e"})
+		assert.Equal(mt, ttlFilter.Key, q[len(q)-1].Key)
+	})
+
+	mt.Run("delete with etag on a server that allows $$NOW in delete", func(mt *mtest.T) {
+		newDeleteStore := func(mt *mtest.T) *MongoDB {
+			m := newStore(mt)
+			m.deleteWithNow = true
+			return m
+		}
+		requireDeleteFilter := func(mt *mtest.T) {
+			mt.Helper()
+			started := mt.GetStartedEvent()
+			require.Equal(mt, "delete", started.CommandName)
+			var q bson.D
+			require.NoError(mt, bson.Unmarshal(started.Command.Lookup("deletes").Array().Index(0).Value().Document().Lookup("q").Document(), &q))
+			assert.Contains(mt, q, bson.E{Key: etag, Value: "e"})
+			assert.Equal(mt, ttlFilter.Key, q[len(q)-1].Key)
+		}
+
+		mt.Run("deletes a matching doc", func(mt *mtest.T) {
+			mt.AddMockResponses(mtest.CreateSuccessResponse(bson.E{Key: "n", Value: 1}))
+
+			require.NoError(mt, newDeleteStore(mt).Delete(mt.Context(), &state.DeleteRequest{Key: "k", ETag: ptr.Of("e")}))
+			requireDeleteFilter(mt)
+		})
+
+		mt.Run("no doc deleted is a mismatch", func(mt *mtest.T) {
+			mt.AddMockResponses(mtest.CreateSuccessResponse(bson.E{Key: "n", Value: 0}))
+
+			err := newDeleteStore(mt).Delete(mt.Context(), &state.DeleteRequest{Key: "k", ETag: ptr.Of("e")})
+			var etagErr *state.ETagError
+			require.ErrorAs(mt, err, &etagErr)
+			assert.Equal(mt, state.ETagMismatch, etagErr.Kind())
+			requireDeleteFilter(mt)
+		})
+
+		mt.Run("command errors are returned", func(mt *mtest.T) {
+			mt.AddMockResponses(mtest.CreateCommandErrorResponse(mtest.CommandError{Code: 2, Name: "BadValue", Message: "delete failed"}))
+
+			err := newDeleteStore(mt).Delete(mt.Context(), &state.DeleteRequest{Key: "k", ETag: ptr.Of("e")})
+			require.ErrorContains(mt, err, "delete failed")
+			var etagErr *state.ETagError
+			require.NotErrorAs(mt, err, &etagErr)
+			requireDeleteFilter(mt)
+		})
+	})
+
+	mt.Run("multi with etag on missing key creates it", func(mt *mtest.T) {
+		mt.AddMockResponses(
+			mtest.CreateSuccessResponse(bson.E{Key: "n", Value: 0}, bson.E{Key: "nModified", Value: 0}),
+			mtest.CreateSuccessResponse(bson.E{Key: "n", Value: 1}, bson.E{Key: "nModified", Value: 0}),
+			mtest.CreateSuccessResponse(),
+		)
+
+		require.NoError(mt, newStore(mt).Multi(mt.Context(), &state.TransactionalStateRequest{
+			Operations: []state.TransactionalStateOperation{
+				state.SetRequest{Key: "k", Value: "v", ETag: ptr.Of("e")},
+			},
+		}))
+		events := mt.GetAllStartedEvents()
+		require.Len(mt, events, 3)
+		assert.True(mt, events[1].Command.Lookup("updates").Array().Index(0).Value().Document().Lookup("upsert").Boolean())
+		assert.Equal(mt, "commitTransaction", events[2].CommandName)
+	})
+
+	mt.Run("multi with etag set after a delete of the same key is a mismatch", func(mt *mtest.T) {
+		err := newStore(mt).Multi(mt.Context(), &state.TransactionalStateRequest{
+			Operations: []state.TransactionalStateOperation{
+				state.DeleteRequest{Key: "k"},
+				state.SetRequest{Key: "k", Value: "v", ETag: ptr.Of("e")},
+			},
+		})
+		var etagErr *state.ETagError
+		require.ErrorAs(mt, err, &etagErr)
+		assert.Equal(mt, state.ETagMismatch, etagErr.Kind())
+		assert.Empty(mt, mt.GetAllStartedEvents())
+	})
+
+	mt.Run("multi returns commit errors", func(mt *mtest.T) {
+		mt.AddMockResponses(
+			mtest.CreateSuccessResponse(bson.E{Key: "n", Value: 1}),
+			mtest.CreateCommandErrorResponse(mtest.CommandError{Code: 2, Name: "BadValue", Message: "commit failed"}),
+		)
+
+		err := newStore(mt).Multi(mt.Context(), &state.TransactionalStateRequest{
+			Operations: []state.TransactionalStateOperation{
+				state.SetRequest{Key: "k", Value: "v"},
+			},
+		})
+		require.ErrorContains(mt, err, "commit failed")
+		assert.Equal(mt, "commitTransaction", mt.GetAllStartedEvents()[1].CommandName)
 	})
 }

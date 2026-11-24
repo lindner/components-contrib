@@ -17,6 +17,9 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"slices"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -86,8 +89,9 @@ func TestPublishAndSubscribeWithPriorityQueue(t *testing.T) {
 	pubsubRabbitMQ := newRabbitMQTest(broker)
 	metadata := pubsub.Metadata{Base: mdata.Base{
 		Properties: map[string]string{
-			metadataHostnameKey:   "anyhost",
-			metadataConsumerIDKey: "consumer",
+			metadataHostnameKey:         "anyhost",
+			metadataConsumerIDKey:       "consumer",
+			metadataDeleteWhenUnusedKey: "false",
 		},
 	}}
 	err := pubsubRabbitMQ.Init(t.Context(), metadata)
@@ -158,6 +162,172 @@ func TestPublishAndSubscribeWithPriorityQueue(t *testing.T) {
 	<-processed
 	assert.Equal(t, 5, messageCount)
 	assert.Equal(t, "dummy data", lastMessage)
+}
+
+func TestComponentQueueType(t *testing.T) {
+	handler := func(ctx context.Context, msg *pubsub.NewMessage) error {
+		return nil
+	}
+
+	subscribe := func(t *testing.T, componentProperties, subscribeMetadata map[string]string) *rabbitMQInMemoryBroker {
+		t.Helper()
+		broker := newBroker()
+		pubsubRabbitMQ := newRabbitMQTest(broker)
+		metadata := pubsub.Metadata{Base: mdata.Base{Properties: componentProperties}}
+		err := pubsubRabbitMQ.Init(t.Context(), metadata)
+		require.NoError(t, err)
+		err = pubsubRabbitMQ.Subscribe(t.Context(), pubsub.SubscribeRequest{Topic: "mytopic", Metadata: subscribeMetadata}, handler)
+		require.NoError(t, err)
+		return broker
+	}
+
+	t.Run("default is classic and dead letter queue keeps lazy mode", func(t *testing.T) {
+		broker := subscribe(t, map[string]string{
+			metadataHostnameKey:         "anyhost",
+			metadataConsumerIDKey:       "consumer",
+			metadataEnableDeadLetterKey: "true",
+		}, nil)
+
+		mainArgs := broker.declaredQueueArgs["consumer-mytopic"]
+		require.NotNil(t, mainArgs)
+		assert.Equal(t, amqp.QueueTypeClassic, mainArgs[amqp.QueueTypeArg])
+
+		dlqArgs := broker.declaredQueueArgs["dlq-consumer-mytopic"]
+		require.NotNil(t, dlqArgs)
+		assert.NotContains(t, dlqArgs, amqp.QueueTypeArg)
+		assert.Equal(t, queueModeLazy, dlqArgs[argQueueMode])
+	})
+
+	t.Run("component-level quorum applies to main queue and dead letter queue", func(t *testing.T) {
+		broker := subscribe(t, map[string]string{
+			metadataHostnameKey:         "anyhost",
+			metadataConsumerIDKey:       "consumer",
+			metadataEnableDeadLetterKey: "true",
+			reqMetadataQueueTypeKey:     "quorum",
+			metadataDeleteWhenUnusedKey: "false",
+		}, nil)
+
+		mainArgs := broker.declaredQueueArgs["consumer-mytopic"]
+		require.NotNil(t, mainArgs)
+		assert.Equal(t, amqp.QueueTypeQuorum, mainArgs[amqp.QueueTypeArg])
+
+		dlqArgs := broker.declaredQueueArgs["dlq-consumer-mytopic"]
+		require.NotNil(t, dlqArgs)
+		assert.Equal(t, amqp.QueueTypeQuorum, dlqArgs[amqp.QueueTypeArg])
+		assert.NotContains(t, dlqArgs, argQueueMode)
+	})
+
+	t.Run("subscription metadata overrides component-level queue type for the queue and its dead letter queue", func(t *testing.T) {
+		broker := subscribe(t, map[string]string{
+			metadataHostnameKey:         "anyhost",
+			metadataConsumerIDKey:       "consumer",
+			metadataEnableDeadLetterKey: "true",
+			reqMetadataQueueTypeKey:     "quorum",
+			metadataDeleteWhenUnusedKey: "false",
+		}, map[string]string{
+			reqMetadataQueueTypeKey: "classic",
+		})
+
+		mainArgs := broker.declaredQueueArgs["consumer-mytopic"]
+		require.NotNil(t, mainArgs)
+		assert.Equal(t, amqp.QueueTypeClassic, mainArgs[amqp.QueueTypeArg])
+
+		dlqArgs := broker.declaredQueueArgs["dlq-consumer-mytopic"]
+		require.NotNil(t, dlqArgs)
+		assert.NotContains(t, dlqArgs, amqp.QueueTypeArg)
+		assert.Equal(t, queueModeLazy, dlqArgs[argQueueMode])
+	})
+
+	t.Run("subscription-level quorum without component-level queueType keeps the dead letter queue classic", func(t *testing.T) {
+		broker := subscribe(t, map[string]string{
+			metadataHostnameKey:         "anyhost",
+			metadataConsumerIDKey:       "consumer",
+			metadataEnableDeadLetterKey: "true",
+			metadataDeleteWhenUnusedKey: "false",
+		}, map[string]string{
+			reqMetadataQueueTypeKey: "quorum",
+		})
+
+		mainArgs := broker.declaredQueueArgs["consumer-mytopic"]
+		require.NotNil(t, mainArgs)
+		assert.Equal(t, amqp.QueueTypeQuorum, mainArgs[amqp.QueueTypeArg])
+
+		dlqArgs := broker.declaredQueueArgs["dlq-consumer-mytopic"]
+		require.NotNil(t, dlqArgs)
+		assert.NotContains(t, dlqArgs, amqp.QueueTypeArg)
+		assert.Equal(t, queueModeLazy, dlqArgs[argQueueMode])
+	})
+
+	t.Run("component-level classic keeps the dead letter queue classic even when the subscription sets quorum", func(t *testing.T) {
+		broker := subscribe(t, map[string]string{
+			metadataHostnameKey:         "anyhost",
+			metadataConsumerIDKey:       "consumer",
+			metadataEnableDeadLetterKey: "true",
+			reqMetadataQueueTypeKey:     "classic",
+			metadataDeleteWhenUnusedKey: "false",
+		}, map[string]string{
+			reqMetadataQueueTypeKey: "quorum",
+		})
+
+		mainArgs := broker.declaredQueueArgs["consumer-mytopic"]
+		require.NotNil(t, mainArgs)
+		assert.Equal(t, amqp.QueueTypeQuorum, mainArgs[amqp.QueueTypeArg])
+
+		dlqArgs := broker.declaredQueueArgs["dlq-consumer-mytopic"]
+		require.NotNil(t, dlqArgs)
+		assert.NotContains(t, dlqArgs, amqp.QueueTypeArg)
+		assert.Equal(t, queueModeLazy, dlqArgs[argQueueMode])
+	})
+
+	t.Run("subscription-level queue type is case-insensitive", func(t *testing.T) {
+		broker := subscribe(t, map[string]string{
+			metadataHostnameKey:         "anyhost",
+			metadataConsumerIDKey:       "consumer",
+			metadataDeleteWhenUnusedKey: "false",
+		}, map[string]string{
+			reqMetadataQueueTypeKey: "Quorum",
+		})
+
+		mainArgs := broker.declaredQueueArgs["consumer-mytopic"]
+		require.NotNil(t, mainArgs)
+		assert.Equal(t, amqp.QueueTypeQuorum, mainArgs[amqp.QueueTypeArg])
+	})
+
+	t.Run("subscription-level quorum with deletedWhenUnused true fails before declaring anything", func(t *testing.T) {
+		broker := newBroker()
+		pubsubRabbitMQ := newRabbitMQTest(broker)
+		err := pubsubRabbitMQ.Init(t.Context(), pubsub.Metadata{Base: mdata.Base{Properties: map[string]string{
+			metadataHostnameKey:         "anyhost",
+			metadataConsumerIDKey:       "consumer",
+			metadataEnableDeadLetterKey: "true",
+		}}})
+		require.NoError(t, err)
+
+		err = pubsubRabbitMQ.Subscribe(t.Context(), pubsub.SubscribeRequest{Topic: "mytopic", Metadata: map[string]string{reqMetadataQueueTypeKey: "quorum"}}, handler)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), metadataDeleteWhenUnusedKey)
+		assert.NotContains(t, broker.declaredQueueArgs, "dlq-consumer-mytopic")
+		assert.NotContains(t, broker.declaredQueueArgs, "consumer-mytopic")
+	})
+
+	t.Run("maxPriority with a quorum queue fails before declaring dead letter objects", func(t *testing.T) {
+		broker := newBroker()
+		pubsubRabbitMQ := newRabbitMQTest(broker)
+		err := pubsubRabbitMQ.Init(t.Context(), pubsub.Metadata{Base: mdata.Base{Properties: map[string]string{
+			metadataHostnameKey:         "anyhost",
+			metadataConsumerIDKey:       "consumer",
+			metadataEnableDeadLetterKey: "true",
+			reqMetadataQueueTypeKey:     "quorum",
+			metadataDeleteWhenUnusedKey: "false",
+		}}})
+		require.NoError(t, err)
+
+		err = pubsubRabbitMQ.Subscribe(t.Context(), pubsub.SubscribeRequest{Topic: "mytopic", Metadata: map[string]string{metadataMaxPriority: "5"}}, handler)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), metadataMaxPriority)
+		assert.NotContains(t, broker.declaredQueueArgs, "dlq-consumer-mytopic")
+		assert.NotContains(t, broker.declaredQueueArgs, "consumer-mytopic")
+	})
 }
 
 func TestConcurrencyMode(t *testing.T) {
@@ -475,16 +645,163 @@ func TestSubscribeReconnect(t *testing.T) {
 	assert.Equal(t, int32(4), broker.closeCount.Load())   // two counts for each connection closure - one for connection, one for channel
 }
 
+// mockAcknowledger tracks Ack/Nack/Reject calls on an amqp.Delivery for unit tests.
+type mockAcknowledger struct {
+	nackCalled   atomic.Bool
+	ackCalled    atomic.Bool
+	rejectCalled atomic.Bool
+	requeue      atomic.Bool
+}
+
+func (m *mockAcknowledger) Ack(_ uint64, _ bool) error {
+	m.ackCalled.Store(true)
+	return nil
+}
+
+func (m *mockAcknowledger) Nack(_ uint64, _ bool, requeue bool) error {
+	m.nackCalled.Store(true)
+	m.requeue.Store(requeue)
+	return nil
+}
+
+func (m *mockAcknowledger) Reject(_ uint64, requeue bool) error {
+	m.rejectCalled.Store(true)
+	m.requeue.Store(requeue)
+	return nil
+}
+
+// TestHandleMessageSkipsNACKOnContextCanceled verifies that handleMessage does
+// not NACK the delivery when the handler returns because the context was
+// cancelled (e.g. during graceful shutdown). Leaving the message unacknowledged
+// lets RabbitMQ redeliver it to another consumer when the connection closes,
+// rather than routing it to the dead-letter queue.
+//
+// Regression test for https://github.com/dapr/components-contrib/issues/4449
+func TestHandleMessageSkipsNACKOnContextCanceled(t *testing.T) {
+	r := &rabbitMQ{
+		logger:   logger.NewLogger("test"),
+		metadata: &rabbitmqMetadata{AutoAck: false},
+	}
+
+	t.Run("context canceled: no NACK, no ACK, context error returned", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel() // already cancelled; simulates subscription context cancelled during shutdown
+
+		ack := &mockAcknowledger{}
+		d := amqp.Delivery{Acknowledger: ack, Body: []byte("test payload")}
+
+		handler := func(ctx context.Context, _ *pubsub.NewMessage) error {
+			return ctx.Err() // returns context.Canceled
+		}
+
+		err := r.handleMessage(ctx, d, "topic", handler)
+		require.ErrorIs(t, err, context.Canceled)
+		assert.False(t, ack.nackCalled.Load(), "NACK must not be called when context is canceled; message should be redelivered, not DLQ'd")
+		assert.False(t, ack.ackCalled.Load(), "ACK must not be called when context is canceled")
+	})
+
+	t.Run("handler error with live context: NACK is called", func(t *testing.T) {
+		ack := &mockAcknowledger{}
+		d := amqp.Delivery{Acknowledger: ack, Body: []byte("test payload")}
+
+		handler := func(_ context.Context, _ *pubsub.NewMessage) error {
+			return errors.New("processing error")
+		}
+
+		// handleMessage re-assigns err = d.Nack(...); our mock returns nil so the
+		// function itself returns nil — what matters is that Nack was invoked.
+		_ = r.handleMessage(context.Background(), d, "topic", handler)
+		assert.True(t, ack.nackCalled.Load(), "NACK must be called on real handler error when context is alive")
+		assert.False(t, ack.ackCalled.Load())
+	})
+
+	t.Run("no error: ACK is called, no NACK", func(t *testing.T) {
+		ack := &mockAcknowledger{}
+		d := amqp.Delivery{Acknowledger: ack, Body: []byte("test payload")}
+
+		handler := func(_ context.Context, _ *pubsub.NewMessage) error {
+			return nil
+		}
+
+		err := r.handleMessage(context.Background(), d, "topic", handler)
+		require.NoError(t, err)
+		assert.True(t, ack.ackCalled.Load(), "ACK must be called on success")
+		assert.False(t, ack.nackCalled.Load(), "NACK must not be called on success")
+	})
+}
+
+// TestHandleMessageRequeueInFailureUsesReject verifies that a failed delivery is requeued with basic.reject
+// rather than basic.nack. Since RabbitMQ 4.3, only basic.reject increments a quorum queue's delivery-count,
+// so with basic.nack the delivery-limit never applies and a poison message is redelivered forever.
+func TestHandleMessageRequeueInFailureUsesReject(t *testing.T) {
+	handler := func(_ context.Context, _ *pubsub.NewMessage) error {
+		return errors.New("processing error")
+	}
+
+	t.Run("requeueInFailure=true: Reject with requeue, no Nack", func(t *testing.T) {
+		r := &rabbitMQ{
+			logger:   logger.NewLogger("test"),
+			metadata: &rabbitmqMetadata{RequeueInFailure: true},
+		}
+		ack := &mockAcknowledger{}
+		d := amqp.Delivery{Acknowledger: ack, Body: []byte("test payload")}
+
+		_ = r.handleMessage(context.Background(), d, "topic", handler)
+		assert.True(t, ack.rejectCalled.Load(), "Reject must be called so RabbitMQ counts the failed delivery")
+		assert.True(t, ack.requeue.Load(), "the message must be requeued")
+		assert.False(t, ack.nackCalled.Load())
+		assert.False(t, ack.ackCalled.Load())
+	})
+
+	t.Run("requeueInFailure=false: Nack without requeue, no Reject", func(t *testing.T) {
+		r := &rabbitMQ{
+			logger:   logger.NewLogger("test"),
+			metadata: &rabbitmqMetadata{RequeueInFailure: false},
+		}
+		ack := &mockAcknowledger{}
+		d := amqp.Delivery{Acknowledger: ack, Body: []byte("test payload")}
+
+		_ = r.handleMessage(context.Background(), d, "topic", handler)
+		assert.True(t, ack.nackCalled.Load())
+		assert.False(t, ack.requeue.Load(), "the message must not be requeued")
+		assert.False(t, ack.rejectCalled.Load())
+		assert.False(t, ack.ackCalled.Load())
+	})
+}
+
 func createAMQPMessage(body []byte) amqp.Delivery {
 	return amqp.Delivery{Body: body}
 }
 
+type declaredExchange struct {
+	name       string
+	kind       string
+	durable    bool
+	autoDelete bool
+	passive    bool
+}
+
 type rabbitMQInMemoryBroker struct {
-	buffer          chan amqp.Delivery
-	declaredQueues  []string
-	connectCount    atomic.Int32
-	closeCount      atomic.Int32
-	lastMsgMetadata *amqp.Publishing // Add this field to capture the last message metadata
+	buffer               chan amqp.Delivery
+	declaredQueues       []string
+	declaredQueueArgs    map[string]amqp.Table
+	declaredExchanges    []declaredExchange
+	boundRoutingKeys     []string
+	connectCount         atomic.Int32
+	closeCount           atomic.Int32
+	lastMsgMetadata      *amqp.Publishing // Add this field to capture the last message metadata
+	exchangeDeclareErr   error
+	queueDeclareErr      error
+	passiveQueueDeclares []string
+
+	// consumeErr, when set, is returned by Consume even though the consumer is
+	// registered, which is what a shared channel does when another command on
+	// it raises a channel-level exception.
+	consumeErr error
+
+	tagsMu        sync.Mutex
+	consumedTags  []string
+	cancelledTags []string
 }
 
 func (r *rabbitMQInMemoryBroker) Qos(prefetchCount, prefetchSize int, global bool) error {
@@ -519,19 +836,42 @@ func (r *rabbitMQInMemoryBroker) PublishWithDeferredConfirmWithContext(ctx conte
 
 func (r *rabbitMQInMemoryBroker) QueueDeclare(name string, durable bool, autoDelete bool, exclusive bool, noWait bool, args amqp.Table) (amqp.Queue, error) {
 	r.declaredQueues = append(r.declaredQueues, name)
-	return amqp.Queue{Name: name}, nil
+	if r.declaredQueueArgs == nil {
+		r.declaredQueueArgs = make(map[string]amqp.Table)
+	}
+	r.declaredQueueArgs[name] = args
+	return amqp.Queue{Name: name}, r.queueDeclareErr
+}
+
+func (r *rabbitMQInMemoryBroker) QueueDeclarePassive(name string, durable bool, autoDelete bool, exclusive bool, noWait bool, args amqp.Table) (amqp.Queue, error) {
+	r.declaredQueues = append(r.declaredQueues, name)
+	r.passiveQueueDeclares = append(r.passiveQueueDeclares, name)
+	return amqp.Queue{Name: name}, r.queueDeclareErr
 }
 
 func (r *rabbitMQInMemoryBroker) QueueBind(name string, key string, exchange string, noWait bool, args amqp.Table) error {
+	r.boundRoutingKeys = append(r.boundRoutingKeys, key)
 	return nil
 }
 
 func (r *rabbitMQInMemoryBroker) Consume(queue string, consumer string, autoAck bool, exclusive bool, noLocal bool, noWait bool, args amqp.Table) (<-chan amqp.Delivery, error) {
-	return r.buffer, nil
+	r.tagsMu.Lock()
+	r.consumedTags = append(r.consumedTags, consumer)
+	r.tagsMu.Unlock()
+	return r.buffer, r.consumeErr
 }
 
 func (r *rabbitMQInMemoryBroker) Cancel(consumer string, noWait bool) error {
+	r.tagsMu.Lock()
+	r.cancelledTags = append(r.cancelledTags, consumer)
+	r.tagsMu.Unlock()
 	return nil
+}
+
+func (r *rabbitMQInMemoryBroker) tags() (consumed, cancelled []string) {
+	r.tagsMu.Lock()
+	defer r.tagsMu.Unlock()
+	return slices.Clone(r.consumedTags), slices.Clone(r.cancelledTags)
 }
 
 func (r *rabbitMQInMemoryBroker) Nack(tag uint64, multiple bool, requeue bool) error {
@@ -543,7 +883,13 @@ func (r *rabbitMQInMemoryBroker) Ack(tag uint64, multiple bool) error {
 }
 
 func (r *rabbitMQInMemoryBroker) ExchangeDeclare(name string, kind string, durable bool, autoDelete bool, internal bool, noWait bool, args amqp.Table) error {
-	return nil
+	r.declaredExchanges = append(r.declaredExchanges, declaredExchange{name: name, kind: kind, durable: durable, autoDelete: autoDelete})
+	return r.exchangeDeclareErr
+}
+
+func (r *rabbitMQInMemoryBroker) ExchangeDeclarePassive(name string, kind string, durable bool, autoDelete bool, internal bool, noWait bool, args amqp.Table) error {
+	r.declaredExchanges = append(r.declaredExchanges, declaredExchange{name: name, kind: kind, durable: durable, autoDelete: autoDelete, passive: true})
+	return r.exchangeDeclareErr
 }
 
 func (r *rabbitMQInMemoryBroker) Confirm(noWait bool) error {
@@ -755,4 +1101,546 @@ func TestPublishMessagePropertiesToMetadataFlag(t *testing.T) {
 		assert.Equal(t, topicName, receivedMsg.Topic)
 		assert.Empty(t, receivedMsg.Metadata, "Metadata should be empty when flag is not set (defaults to false)")
 	})
+}
+
+func newRabbitMQForExchangeTest(broker *rabbitMQInMemoryBroker, meta *rabbitmqMetadata) *rabbitMQ {
+	return &rabbitMQ{
+		declaredExchanges: make(map[string]bool),
+		logger:            logger.NewLogger("test"),
+		metadata:          meta,
+		channel:           broker,
+		closeCh:           make(chan struct{}),
+	}
+}
+
+// TestEnsureExchangeDeclaredActive verifies that the default declare mode still
+// issues an active exchange.declare.
+func TestEnsureExchangeDeclaredActive(t *testing.T) {
+	broker := newBroker()
+	r := newRabbitMQForExchangeTest(broker, &rabbitmqMetadata{
+		ExchangeKind:        fanoutExchangeKind,
+		ExchangeDeclareMode: exchangeDeclareModeDeclare,
+	})
+
+	require.NoError(t, r.ensureExchangeDeclared(broker, "mytopic", fanoutExchangeKind, true, true, false))
+	require.Len(t, broker.declaredExchanges, 1)
+	assert.Equal(t, "mytopic", broker.declaredExchanges[0].name)
+	assert.False(t, broker.declaredExchanges[0].passive)
+
+	// The exchange is cached, so a second call is a no-op.
+	require.NoError(t, r.ensureExchangeDeclared(broker, "mytopic", fanoutExchangeKind, true, true, false))
+	assert.Len(t, broker.declaredExchanges, 1)
+}
+
+// TestEnsureExchangeDeclaredPassive verifies that passive mode only asserts that
+// the externally managed exchange exists.
+func TestEnsureExchangeDeclaredPassive(t *testing.T) {
+	broker := newBroker()
+	r := newRabbitMQForExchangeTest(broker, &rabbitmqMetadata{
+		ExchangeKind:        exchangeKindConsistentHash,
+		ExchangeDeclareMode: exchangeDeclareModePassive,
+	})
+
+	require.NoError(t, r.ensureExchangeDeclared(broker, "mytopic", exchangeKindConsistentHash, true, true, true))
+	require.Len(t, broker.declaredExchanges, 1)
+	assert.Equal(t, "mytopic", broker.declaredExchanges[0].name)
+	assert.True(t, broker.declaredExchanges[0].passive)
+}
+
+// TestEnsureExchangeDeclaredPassiveMissingExchange verifies the error raised
+// when the externally managed exchange has not been created.
+func TestEnsureExchangeDeclaredPassiveMissingExchange(t *testing.T) {
+	broker := newBroker()
+	broker.exchangeDeclareErr = &amqp.Error{Code: amqp.NotFound, Reason: "NOT_FOUND - no exchange 'mytopic' in vhost '/'"}
+	r := newRabbitMQForExchangeTest(broker, &rabbitmqMetadata{
+		ExchangeKind:        exchangeKindConsistentHash,
+		ExchangeDeclareMode: exchangeDeclareModePassive,
+	})
+
+	err := r.ensureExchangeDeclared(broker, "mytopic", exchangeKindConsistentHash, true, true, true)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "does not exist")
+	assert.Contains(t, err.Error(), metadataExchangeDeclareModeKey)
+	assert.False(t, r.containsExchange("mytopic"))
+	// Retrying cannot create it, and retrying drops the shared connection.
+	require.ErrorIs(t, err, errTerminalSubscription)
+}
+
+// TestEnsureExchangeDeclaredPreconditionFailed verifies that a mismatch against
+// an exchange declared elsewhere points at the passive declare mode.
+func TestEnsureExchangeDeclaredPreconditionFailed(t *testing.T) {
+	broker := newBroker()
+	broker.exchangeDeclareErr = &amqp.Error{Code: amqp.PreconditionFailed, Reason: "PRECONDITION_FAILED - inequivalent arg 'type'"}
+	r := newRabbitMQForExchangeTest(broker, &rabbitmqMetadata{
+		ExchangeKind:        fanoutExchangeKind,
+		ExchangeDeclareMode: exchangeDeclareModeDeclare,
+	})
+
+	err := r.ensureExchangeDeclared(broker, "mytopic", fanoutExchangeKind, true, true, false)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "already exists with properties that differ")
+	assert.Contains(t, err.Error(), exchangeDeclareModePassive)
+	require.ErrorIs(t, err, errTerminalSubscription)
+}
+
+// TestSubscribeUsesPassiveExchangeDeclare covers the end-to-end path: the topic
+// exchange is only asserted, while the dead letter exchange - whose name is
+// derived from consumerID and topic at runtime, so no external owner could have
+// pre-created it - is still declared by the component.
+func TestSubscribeUsesPassiveExchangeDeclare(t *testing.T) {
+	broker := newBroker()
+	pubsubRabbitMQ := newRabbitMQTest(broker)
+	metadata := pubsub.Metadata{Base: mdata.Base{
+		Properties: map[string]string{
+			metadataHostnameKey:            "anyhost",
+			metadataConsumerIDKey:          "consumer",
+			metadataExchangeDeclareModeKey: exchangeDeclareModePassive,
+			metadataEnableDeadLetterKey:    "true",
+		},
+	}}
+	require.NoError(t, pubsubRabbitMQ.Init(t.Context(), metadata))
+
+	handler := func(ctx context.Context, msg *pubsub.NewMessage) error { return nil }
+	require.NoError(t, pubsubRabbitMQ.Subscribe(t.Context(), pubsub.SubscribeRequest{Topic: "mytopic"}, handler))
+
+	byName := map[string]declaredExchange{}
+	for _, e := range broker.declaredExchanges {
+		byName[e.name] = e
+	}
+
+	topic, ok := byName["mytopic"]
+	require.True(t, ok, "the topic exchange should have been declared")
+	assert.True(t, topic.passive, "the topic exchange is externally managed")
+
+	dlx, ok := byName["dlx-consumer-mytopic"]
+	require.True(t, ok, "the dead letter exchange should have been declared")
+	assert.False(t, dlx.passive, "the dead letter exchange is this component's own object")
+}
+
+// TestConsistentHashBindingRoutingKey verifies the bucket weight validation
+// applied to subscriptions bound to a consistent hash exchange.
+func TestConsistentHashBindingRoutingKey(t *testing.T) {
+	tests := []struct {
+		name       string
+		routingKey string
+		wantErr    bool
+	}{
+		{name: "missing weight", routingKey: "", wantErr: true},
+		{name: "non numeric weight", routingKey: "orders", wantErr: true},
+		{name: "zero weight", routingKey: "0", wantErr: true},
+		{name: "valid weight", routingKey: "10", wantErr: false},
+		{name: "multiple weights", routingKey: "10,20", wantErr: true},
+		{name: "padded weight", routingKey: " 10 ", wantErr: true},
+		{name: "one invalid weight", routingKey: "10,orders", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			broker := newBroker()
+			r := newRabbitMQForExchangeTest(broker, &rabbitmqMetadata{
+				ExchangeKind:        exchangeKindConsistentHash,
+				ExchangeDeclareMode: exchangeDeclareModePassive,
+			})
+
+			req := pubsub.SubscribeRequest{Topic: "mytopic"}
+			if tt.routingKey != "" {
+				req.Metadata = map[string]string{reqMetadataRoutingKey: tt.routingKey}
+			}
+
+			_, err := r.prepareSubscription(broker, req, "consumer-mytopic")
+			if !tt.wantErr {
+				require.NoError(t, err)
+				assert.Equal(t, strings.Split(tt.routingKey, ","), broker.boundRoutingKeys)
+				return
+			}
+
+			require.Error(t, err)
+			require.ErrorIs(t, err, errTerminalSubscription)
+			assert.Contains(t, err.Error(), exchangeKindConsistentHash)
+			assert.Empty(t, broker.boundRoutingKeys)
+		})
+	}
+}
+
+// TestBindingRoutingKeyNotValidatedForOtherKinds makes sure the bucket weight
+// rule is scoped to consistent hash exchanges only.
+func TestBindingRoutingKeyNotValidatedForOtherKinds(t *testing.T) {
+	broker := newBroker()
+	r := newRabbitMQForExchangeTest(broker, &rabbitmqMetadata{
+		ExchangeKind:        amqp.ExchangeTopic,
+		ExchangeDeclareMode: exchangeDeclareModeDeclare,
+	})
+
+	_, err := r.prepareSubscription(broker, pubsub.SubscribeRequest{
+		Topic:    "mytopic",
+		Metadata: map[string]string{reqMetadataRoutingKey: "orders.created"},
+	}, "consumer-mytopic")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"orders.created"}, broker.boundRoutingKeys)
+}
+
+// TestPassiveQueueDeclareSkipsDeclareAndBind verifies that with an externally
+// owned queue the component neither creates the queue nor binds it.
+func TestPassiveQueueDeclareSkipsDeclareAndBind(t *testing.T) {
+	broker := newBroker()
+	r := newRabbitMQForExchangeTest(broker, &rabbitmqMetadata{
+		ExchangeKind:        exchangeKindConsistentHash,
+		ExchangeDeclareMode: exchangeDeclareModePassive,
+		QueueDeclareMode:    queueDeclareModePassive,
+	})
+
+	q, err := r.prepareSubscription(broker, pubsub.SubscribeRequest{Topic: "mytopic"}, "operator-owned-queue")
+	require.NoError(t, err)
+	assert.Equal(t, "operator-owned-queue", q.Name)
+	assert.Equal(t, []string{"operator-owned-queue"}, broker.passiveQueueDeclares)
+	assert.Empty(t, broker.boundRoutingKeys, "bindings belong to the external owner")
+}
+
+// TestPassiveQueueDeclareIgnoresDeadLetter verifies that dead lettering is left
+// entirely to the external owner: the component must not require a dead letter
+// queue following its own naming convention to exist.
+func TestPassiveQueueDeclareIgnoresDeadLetter(t *testing.T) {
+	broker := newBroker()
+	r := newRabbitMQForExchangeTest(broker, &rabbitmqMetadata{
+		ExchangeKind:        amqp.ExchangeTopic,
+		ExchangeDeclareMode: exchangeDeclareModePassive,
+		QueueDeclareMode:    queueDeclareModePassive,
+		EnableDeadLetter:    true,
+	})
+
+	_, err := r.prepareSubscription(broker, pubsub.SubscribeRequest{Topic: "mytopic"}, "operator-owned-queue")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"operator-owned-queue"}, broker.passiveQueueDeclares,
+		"the dead letter queue belongs to the external owner and must not be asserted")
+	assert.Empty(t, broker.boundRoutingKeys)
+}
+
+// TestPassiveQueueDeclareMissingQueue verifies the error raised when the
+// externally managed queue has not been created.
+func TestPassiveQueueDeclareMissingQueue(t *testing.T) {
+	broker := newBroker()
+	broker.queueDeclareErr = &amqp.Error{Code: amqp.NotFound, Reason: "NOT_FOUND - no queue 'operator-owned-queue' in vhost '/'"}
+	r := newRabbitMQForExchangeTest(broker, &rabbitmqMetadata{
+		ExchangeKind:        amqp.ExchangeTopic,
+		ExchangeDeclareMode: exchangeDeclareModePassive,
+		QueueDeclareMode:    queueDeclareModePassive,
+	})
+
+	_, err := r.prepareSubscription(broker, pubsub.SubscribeRequest{Topic: "mytopic"}, "operator-owned-queue")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "does not exist")
+	assert.Contains(t, err.Error(), metadataQueueDeclareModeKey)
+}
+
+// TestPassiveQueueDeclareSkipsBucketWeightValidation verifies that the
+// consistent hash bucket weight rule does not apply when the component is not
+// the one creating the binding.
+func TestPassiveQueueDeclareSkipsBucketWeightValidation(t *testing.T) {
+	broker := newBroker()
+	r := newRabbitMQForExchangeTest(broker, &rabbitmqMetadata{
+		ExchangeKind:        exchangeKindConsistentHash,
+		ExchangeDeclareMode: exchangeDeclareModePassive,
+		QueueDeclareMode:    queueDeclareModePassive,
+	})
+
+	// No routingKey at all, which would be rejected in declare mode.
+	_, err := r.prepareSubscription(broker, pubsub.SubscribeRequest{Topic: "mytopic"}, "operator-owned-queue")
+	require.NoError(t, err)
+}
+
+// TestDecorateExchangeDeclareErrorPassesThroughUnrelatedErrors verifies that
+// only the two failures specific to externally managed topologies are
+// rewritten, and every other error reaches the caller untouched.
+func TestDecorateExchangeDeclareErrorPassesThroughUnrelatedErrors(t *testing.T) {
+	tests := []struct {
+		name        string
+		declareMode string
+		err         error
+	}{
+		{
+			name:        "not an AMQP error",
+			declareMode: exchangeDeclareModeDeclare,
+			err:         errors.New("channel/connection is not open"),
+		},
+		{
+			name:        "AMQP error of another code",
+			declareMode: exchangeDeclareModeDeclare,
+			err:         &amqp.Error{Code: amqp.AccessRefused, Reason: "ACCESS_REFUSED - access to exchange 'mytopic' refused"},
+		},
+		{
+			// Only meaningful when the component was not going to create the
+			// exchange anyway; in declare mode a 404 is not a topology
+			// ownership problem.
+			name:        "not found while declaring",
+			declareMode: exchangeDeclareModeDeclare,
+			err:         &amqp.Error{Code: amqp.NotFound, Reason: "NOT_FOUND - no exchange 'mytopic' in vhost '/'"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := newRabbitMQForExchangeTest(newBroker(), &rabbitmqMetadata{
+				ExchangeKind:        fanoutExchangeKind,
+				ExchangeDeclareMode: tt.declareMode,
+			})
+
+			got := r.decorateExchangeDeclareError("mytopic", fanoutExchangeKind, true, true, false, tt.err)
+
+			assert.Equal(t, tt.err, got)
+		})
+	}
+}
+
+// TestSubscribeSurfacesTerminalError verifies that a subscription rejected for
+// a configuration reason reports why, instead of a bare "not retriable".
+func TestSubscribeSurfacesTerminalError(t *testing.T) {
+	broker := newBroker()
+	pubsubRabbitMQ := newRabbitMQTest(broker)
+	metadata := pubsub.Metadata{Base: mdata.Base{
+		Properties: map[string]string{
+			metadataHostnameKey:     "anyhost",
+			metadataConsumerIDKey:   "consumer",
+			metadataExchangeKindKey: exchangeKindConsistentHash,
+		},
+	}}
+	require.NoError(t, pubsubRabbitMQ.Init(t.Context(), metadata))
+
+	// No routingKey, so no bucket weight for the consistent hash binding.
+	err := pubsubRabbitMQ.Subscribe(t.Context(), pubsub.SubscribeRequest{Topic: "mytopic"}, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not retriable")
+	assert.Contains(t, err.Error(), reqMetadataRoutingKey, "the reason must reach the caller, not just the retry loop")
+	assert.Contains(t, err.Error(), exchangeKindConsistentHash)
+}
+
+// TestActiveQueueDeclarePreconditionFailed verifies that a queue property
+// mismatch points at the mode that resolves it, as exchange declares do.
+func TestActiveQueueDeclarePreconditionFailed(t *testing.T) {
+	broker := newBroker()
+	broker.queueDeclareErr = &amqp.Error{Code: amqp.PreconditionFailed, Reason: "PRECONDITION_FAILED - inequivalent arg 'durable'"}
+	r := newRabbitMQForExchangeTest(broker, &rabbitmqMetadata{
+		ExchangeKind:        amqp.ExchangeTopic,
+		ExchangeDeclareMode: exchangeDeclareModeDeclare,
+		QueueDeclareMode:    queueDeclareModeDeclare,
+	})
+
+	_, err := r.prepareSubscription(broker, pubsub.SubscribeRequest{Topic: "mytopic"}, "consumer-mytopic")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "already exists with properties that differ")
+	assert.Contains(t, err.Error(), metadataQueueDeclareModeKey)
+}
+
+// TestPassiveQueueDeclareIgnoresQueueArguments verifies that queue arguments
+// are neither validated nor sent when the queue belongs to someone else. A
+// queue type this component cannot declare must still be consumable.
+func TestPassiveQueueDeclareIgnoresQueueArguments(t *testing.T) {
+	broker := newBroker()
+	r := newRabbitMQForExchangeTest(broker, &rabbitmqMetadata{
+		ExchangeKind:        amqp.ExchangeTopic,
+		ExchangeDeclareMode: exchangeDeclareModePassive,
+		QueueDeclareMode:    queueDeclareModePassive,
+	})
+
+	_, err := r.prepareSubscription(broker, pubsub.SubscribeRequest{
+		Topic: "mytopic",
+		Metadata: map[string]string{
+			reqMetadataQueueTypeKey: "stream", // neither classic nor quorum
+			metadataMaxPriority:     "5",
+			reqMetadataMaxLenKey:    "100",
+		},
+	}, "operator-owned-queue")
+
+	require.NoError(t, err, "queue arguments belong to the external owner and must not be validated")
+	assert.Equal(t, []string{"operator-owned-queue"}, broker.passiveQueueDeclares)
+	assert.Empty(t, broker.boundRoutingKeys)
+}
+
+// TestActiveQueueDeclareStillValidatesQueueType guards the counterpart: when
+// this component declares the queue, an unsupported type is still rejected,
+// and it is rejected before any dead letter object is declared so none is left
+// behind on the broker.
+func TestActiveQueueDeclareStillValidatesQueueType(t *testing.T) {
+	broker := newBroker()
+	r := newRabbitMQForExchangeTest(broker, &rabbitmqMetadata{
+		ExchangeKind:        amqp.ExchangeTopic,
+		ExchangeDeclareMode: exchangeDeclareModeDeclare,
+		QueueDeclareMode:    queueDeclareModeDeclare,
+		EnableDeadLetter:    true,
+	})
+
+	_, err := r.prepareSubscription(broker, pubsub.SubscribeRequest{
+		Topic:    "mytopic",
+		Metadata: map[string]string{reqMetadataQueueTypeKey: "stream"},
+	}, "consumer-mytopic")
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), errorInvalidQueueType)
+	assert.NotContains(t, broker.declaredQueueArgs, "dlq-consumer-mytopic")
+	for _, exchange := range broker.declaredExchanges {
+		assert.NotEqual(t, "dlx-consumer-mytopic", exchange.name)
+	}
+}
+
+// TestMustReconnectOnAMQPError verifies that any AMQP error is treated as a
+// dead channel. A failed declare is a channel exception, so without this the
+// loop spends an attempt on a channel the broker has already closed.
+func TestMustReconnectOnAMQPError(t *testing.T) {
+	broker := newBroker()
+
+	assert.True(t, mustReconnect(broker, &amqp.Error{Code: amqp.NotFound, Reason: "NOT_FOUND - no exchange 'mytopic' in vhost '/'"}))
+	assert.True(t, mustReconnect(broker, &amqp.Error{Code: amqp.PreconditionFailed, Reason: "PRECONDITION_FAILED - inequivalent arg 'type'"}))
+	assert.True(t, mustReconnect(broker, errors.New(errorChannelConnection)))
+	assert.True(t, mustReconnect(nil, nil))
+	assert.False(t, mustReconnect(broker, nil))
+	assert.False(t, mustReconnect(broker, errors.New("handler failed")))
+}
+
+// TestSubscribeFailsFastOnMissingPassiveObject is the regression test for the
+// connection teardown: a missing externally managed object must fail the
+// subscription with the actionable message, not spin in the retry loop where
+// reset() drops the connection shared by every other subscription.
+func TestSubscribeFailsFastOnMissingPassiveObject(t *testing.T) {
+	tests := []struct {
+		name        string
+		declareErr  func(*rabbitMQInMemoryBroker)
+		wantMessage string
+	}{
+		{
+			name: "missing exchange",
+			declareErr: func(b *rabbitMQInMemoryBroker) {
+				b.exchangeDeclareErr = &amqp.Error{Code: amqp.NotFound, Reason: "NOT_FOUND - no exchange 'mytopic' in vhost '/'"}
+			},
+			wantMessage: metadataExchangeDeclareModeKey,
+		},
+		{
+			name: "missing queue",
+			declareErr: func(b *rabbitMQInMemoryBroker) {
+				b.queueDeclareErr = &amqp.Error{Code: amqp.NotFound, Reason: "NOT_FOUND - no queue 'consumer-mytopic' in vhost '/'"}
+			},
+			wantMessage: metadataQueueDeclareModeKey,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			broker := newBroker()
+			tt.declareErr(broker)
+
+			pubsubRabbitMQ := newRabbitMQTest(broker)
+			require.NoError(t, pubsubRabbitMQ.Init(t.Context(), pubsub.Metadata{Base: mdata.Base{
+				Properties: map[string]string{
+					metadataHostnameKey:            "anyhost",
+					metadataConsumerIDKey:          "consumer",
+					metadataExchangeDeclareModeKey: exchangeDeclareModePassive,
+					metadataQueueDeclareModeKey:    queueDeclareModePassive,
+					metadataExchangeKindKey:        amqp.ExchangeTopic,
+				},
+			}}))
+
+			start := time.Now()
+			err := pubsubRabbitMQ.Subscribe(t.Context(), pubsub.SubscribeRequest{Topic: "mytopic"}, nil)
+
+			require.Error(t, err)
+			// The one-minute path is what the retry loop would take.
+			assert.Less(t, time.Since(start), 30*time.Second, "the subscription must fail fast, not sit in the retry loop")
+			assert.Contains(t, err.Error(), "does not exist")
+			assert.Contains(t, err.Error(), tt.wantMessage)
+		})
+	}
+}
+
+// TestDeadLetterFollowsQueueDeclareMode verifies that the dead letter objects
+// are governed by queueDeclareMode, not exchangeDeclareMode. Their names are
+// derived at runtime, so an external topology owner cannot pre-create them.
+func TestDeadLetterFollowsQueueDeclareMode(t *testing.T) {
+	t.Run("declared queue declares its dead letter objects even behind a passive exchange", func(t *testing.T) {
+		broker := newBroker()
+		r := newRabbitMQForExchangeTest(broker, &rabbitmqMetadata{
+			ExchangeKind:        amqp.ExchangeTopic,
+			ExchangeDeclareMode: exchangeDeclareModePassive,
+			QueueDeclareMode:    queueDeclareModeDeclare,
+			EnableDeadLetter:    true,
+		})
+
+		_, err := r.prepareSubscription(broker, pubsub.SubscribeRequest{Topic: "mytopic"}, "consumer-mytopic")
+		require.NoError(t, err)
+
+		assert.Contains(t, broker.declaredQueues, "dlq-consumer-mytopic")
+		assert.Empty(t, broker.passiveQueueDeclares, "dead letter objects are the component's own")
+		for _, e := range broker.declaredExchanges {
+			if e.name == "dlx-consumer-mytopic" {
+				assert.False(t, e.passive, "the dead letter exchange must be declared, not asserted")
+			}
+		}
+	})
+
+	t.Run("passive queue leaves dead lettering to the owner", func(t *testing.T) {
+		broker := newBroker()
+		r := newRabbitMQForExchangeTest(broker, &rabbitmqMetadata{
+			ExchangeKind:        amqp.ExchangeTopic,
+			ExchangeDeclareMode: exchangeDeclareModePassive,
+			QueueDeclareMode:    queueDeclareModePassive,
+			EnableDeadLetter:    true,
+		})
+
+		_, err := r.prepareSubscription(broker, pubsub.SubscribeRequest{Topic: "mytopic"}, "operator-owned-queue")
+		require.NoError(t, err)
+
+		assert.NotContains(t, broker.declaredQueues, "dlq-operator-owned-queue")
+		for _, e := range broker.declaredExchanges {
+			assert.NotEqual(t, "dlx-operator-owned-queue", e.name, "the dead letter exchange must not be touched")
+		}
+	})
+}
+
+// A consumer registered on a shared channel survives a Consume error raised by
+// another command on that channel, so the tag has to be cancelled on every exit
+// from the subscribe loop, not only after listenMessages returns. Otherwise the
+// registration is orphaned and keeps holding its prefetch allowance.
+func TestSubscribeForeverCancelsConsumerWhenConsumeFails(t *testing.T) {
+	broker := newBroker()
+	broker.consumeErr = errors.New(errorChannelConnection)
+
+	r := newRabbitMQTest(broker)
+	metadata := pubsub.Metadata{Base: mdata.Base{
+		Properties: map[string]string{
+			metadataHostnameKey:             "anyhost",
+			metadataConsumerIDKey:           "consumer",
+			metadataReconnectWaitSecondsKey: "0",
+		},
+	}}
+	require.NoError(t, r.Init(t.Context(), metadata))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.subscribeForever(ctx, pubsub.SubscribeRequest{Topic: "mytopic"}, "myqueue", func(context.Context, *pubsub.NewMessage) error { return nil }, nil)
+	}()
+
+	require.Eventually(t, func() bool {
+		consumed, _ := broker.tags()
+		return len(consumed) >= 2
+	}, 5*time.Second, 10*time.Millisecond, "expected the subscriber to retry")
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("subscribeForever did not return")
+	}
+
+	consumed, cancelled := broker.tags()
+	for _, tag := range consumed {
+		require.Containsf(t, cancelled, tag, "consumer %s was registered but never cancelled", tag)
+	}
+}
+
+type fakeConfirmation struct{ acked bool }
+
+func (f fakeConfirmation) Wait() bool { return f.acked }
+
+func TestConfirmationError(t *testing.T) {
+	require.NoError(t, confirmationError(fakeConfirmation{acked: true}))
+	require.Error(t, confirmationError(fakeConfirmation{acked: false}))
 }

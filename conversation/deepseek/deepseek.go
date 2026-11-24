@@ -64,7 +64,12 @@ func (d *Deepseek) Init(ctx context.Context, meta conversation.Metadata) error {
 		md.Endpoint = defaultEndpoint
 	}
 
-	options := conversation.BuildOpenAIClientOptions(model, md.Key, md.Endpoint)
+	headers, err := conversation.ParseHeaders(md.Headers)
+	if err != nil {
+		return err
+	}
+
+	options := conversation.BuildOpenAIClientOptions(model, md.Key, md.Endpoint, headers)
 	llm, err := openai.New(options...)
 	if err != nil {
 		return err
@@ -72,6 +77,10 @@ func (d *Deepseek) Init(ctx context.Context, meta conversation.Metadata) error {
 
 	d.Model = llm
 	d.SetModel(model)
+	d.SetDefaultMaxTokens(md.MaxTokens)
+	// DeepSeek documents only the legacy max_tokens field;
+	// max_completion_tokens is not supported.
+	d.SetPostCallOptions(openai.WithLegacyMaxTokensField())
 	d.md = md
 	return nil
 }

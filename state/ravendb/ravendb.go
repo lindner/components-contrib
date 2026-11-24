@@ -17,10 +17,8 @@ package ravendb
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/http"
@@ -51,6 +49,9 @@ const (
 	expires             = "@expires"
 	defaultEnableTTL    = true
 	defaultTTLFrequency = int64(60)
+
+	// expiresLayout is the ISO-8601 layout RavenDB uses for the @expires metadata value.
+	expiresLayout = "2006-01-02T15:04:05.9999999Z07:00"
 )
 
 type RavenDB struct {
@@ -103,8 +104,17 @@ func (r *RavenDB) Init(ctx context.Context, metadata state.Metadata) (err error)
 		return errors.New("error in creating Raven DB Store")
 	}
 
-	r.initTTL()
-	r.setupDatabase()
+	// The database must exist before expiration can be configured on it.
+	if err = r.setupDatabase(); err != nil {
+		r.logger.Warnf("Failed to set up RavenDB database %q: %v", r.metadata.DatabaseName, err)
+	}
+
+	// Server-side expiration only reclaims storage: expired documents are
+	// filtered out on read, so a failure here must not fail initialization.
+	// Some RavenDB licenses reject delete frequencies below their minimum.
+	if err = r.initTTL(); err != nil {
+		r.logger.Warnf("Failed to configure RavenDB document expiration, expired items will not be removed from storage: %v", err)
+	}
 
 	return nil
 }
@@ -158,19 +168,16 @@ func (r *RavenDB) Get(ctx context.Context, req *state.GetRequest) (*state.GetRes
 	}
 
 	meta := make(map[string]string)
-	ttl, okTTL := ravenMeta.Get(expires)
-	if okTTL {
-		meta = map[string]string{
-			state.GetRespMetaKeyTTLExpireTime: ttl.(string),
+	if expiry, ok := expiryFromMetadata(ravenMeta); ok {
+		if isExpired(expiry) {
+			return &state.GetResponse{}, nil
 		}
+		meta[state.GetRespMetaKeyTTLExpireTime] = expiry.UTC().Format(time.RFC3339)
 	}
 
 	var etagResp string
-	eTag, okETag := ravenMeta.Get(changeVector)
-	if okETag {
-		etagResp = eTag.(string)
-	} else {
-		etagResp = ""
+	if eTag, okETag := ravenMeta.Get(changeVector); okETag {
+		etagResp, _ = eTag.(string)
 	}
 
 	resp := &state.GetResponse{
@@ -189,7 +196,7 @@ func (r *RavenDB) Set(ctx context.Context, req *state.SetRequest) error {
 	defer session.Close()
 	err = r.setInternal(ctx, req, session)
 	if err != nil {
-		return fmt.Errorf("error processing item %s", err)
+		return fmt.Errorf("error processing item %w", err)
 	}
 
 	err = session.SaveChanges()
@@ -213,17 +220,54 @@ func (r *RavenDB) Ping(ctx context.Context) error {
 }
 
 func (r *RavenDB) Multi(ctx context.Context, request *state.TransactionalStateRequest) error {
+	// Parsed before collapsing so a dropped set's invalid TTL still fails the transaction.
+	for _, op := range request.Operations {
+		if req, ok := op.(state.SetRequest); ok {
+			if _, err := stateutils.ParseTTL(req.Metadata); err != nil {
+				return fmt.Errorf("failed to parse TTL: %w", err)
+			}
+		}
+	}
+
+	// The session rejects a second op on one document with an untyped error.
+	ops, err := stateutils.CollapseOps(request.Operations)
+	if err != nil {
+		return err
+	}
+
 	session, err := r.documentStore.OpenSession(r.metadata.DatabaseName)
 	if err != nil {
 		return fmt.Errorf("opening session while sending transaction failed with error %s", err)
 	}
 	defer session.Close()
-	for _, o := range request.Operations {
-		switch req := o.(type) {
+	for _, o := range ops {
+		switch req := o.Op.(type) {
 		case state.SetRequest:
+			req.ETag, req.Options.Concurrency = guardOf(o.Guard)
 			err = r.setInternal(ctx, &req, session)
 		case state.DeleteRequest:
-			err = r.deleteInternal(ctx, &req, session, true)
+			var concurrency string
+			req.ETag, concurrency = guardOf(o.Guard)
+			switch {
+			case !req.HasETag() && concurrency == state.FirstWrite:
+				_, err = r.checkMissing(session, req.Key)
+			case req.HasETag() && (concurrency == state.FirstWrite || isDelete(o.Guard)):
+				// The guard is a delete with an etag, which is a no-op on a missing document as before #4666,
+				// or a first-write set with an etag, which creates a missing or expired document so deleting
+				// it afterwards leaves nothing to do. Either way only an expired document is left to remove.
+				var live bool
+				var expiredCV string
+				live, expiredCV, err = loadForWrite(session, req.Key)
+				switch {
+				case err != nil:
+				case live:
+					err = r.deleteInternal(ctx, &req, session, true)
+				case expiredCV != "":
+					err = session.DeleteByID(req.Key, expiredCV)
+				}
+			default:
+				err = r.deleteInternal(ctx, &req, session, true)
+			}
 		}
 
 		if err != nil {
@@ -240,6 +284,63 @@ func (r *RavenDB) Multi(ctx context.Context, request *state.TransactionalStateRe
 	}
 
 	return nil
+}
+
+func isDelete(op state.TransactionalStateOperation) bool {
+	_, ok := op.(state.DeleteRequest)
+	return ok
+}
+
+func guardOf(op state.TransactionalStateOperation) (*string, string) {
+	switch req := op.(type) {
+	case state.SetRequest:
+		return req.ETag, req.Options.Concurrency
+	case state.DeleteRequest:
+		return req.ETag, ""
+	}
+	return nil, ""
+}
+
+// loadForWrite reports whether key has a live document, and returns the change vector of an
+// expired one, so a store can replace exactly that version. A missing key returns false and "".
+// A loaded document is evicted, so a later store or delete of the key isn't rejected by the
+// session's tracking, and a store replaces it whole: the client can't drop @expires from a loaded document.
+func loadForWrite(session *ravendb.DocumentSession, key string) (bool, string, error) {
+	var existing *Item
+	if err := session.Load(&existing, key); err != nil {
+		return false, "", fmt.Errorf("error loading data: %w", err)
+	}
+	if existing == nil {
+		return false, "", nil
+	}
+	meta, err := session.Advanced().GetMetadataFor(existing)
+	if err != nil {
+		return false, "", fmt.Errorf("error loading metadata: %w", err)
+	}
+	live, expiredCV := true, ""
+	if expiry, ok := expiryFromMetadata(meta); ok && isExpired(expiry) {
+		cv, err := session.Advanced().GetChangeVectorFor(existing)
+		if err != nil {
+			return false, "", fmt.Errorf("error loading change vector: %w", err)
+		}
+		live, expiredCV = false, *cv
+	}
+	if err := session.Advanced().Evict(existing); err != nil {
+		return false, "", fmt.Errorf("error evicting data: %w", err)
+	}
+	return live, expiredCV, nil
+}
+
+// checkMissing returns the change vector of an expired document, so a store can replace exactly that version.
+func (r *RavenDB) checkMissing(session *ravendb.DocumentSession, key string) (string, error) {
+	live, expiredCV, err := loadForWrite(session, key)
+	if err != nil {
+		return "", err
+	}
+	if live {
+		return "", state.NewETagError(state.ETagMismatch, fmt.Errorf("key %s already exists", key))
+	}
+	return expiredCV, nil
 }
 
 func (r *RavenDB) BulkGet(ctx context.Context, req []state.GetRequest, _ state.BulkGetOpts) ([]state.BulkGetResponse, error) {
@@ -267,37 +368,73 @@ func (r *RavenDB) BulkGet(ctx context.Context, req []state.GetRequest, _ state.B
 
 	for ID, current := range items {
 		if current == nil {
-			convert := state.BulkGetResponse{
-				Key:      ID,
-				Data:     nil,
-				ETag:     nil,
-				Metadata: make(map[string]string),
-			}
-			resp = append(resp, convert)
-		} else {
-			meta := make(map[string]string)
-			ravenMeta, err := session.GetMetadataFor(current)
-			etagResp := ""
-			if err == nil {
-				if eTag, okETag := ravenMeta.Get(changeVector); okETag {
-					etagResp = eTag.(string)
-				}
-				if ttl, okTTL := ravenMeta.Get(expires); okTTL {
-					meta[state.GetRespMetaKeyTTLExpireTime] = ttl.(string)
-				}
-			}
-
-			convert := state.BulkGetResponse{
-				Key:      current.ID,
-				Data:     []byte(current.Value),
-				ETag:     &etagResp,
-				Metadata: meta,
-			}
-			resp = append(resp, convert)
+			resp = append(resp, missingBulkGetResponse(ID))
+			continue
 		}
+
+		meta := make(map[string]string)
+		etagResp := ""
+		if ravenMeta, err := session.GetMetadataFor(current); err == nil {
+			if eTag, okETag := ravenMeta.Get(changeVector); okETag {
+				etagResp, _ = eTag.(string)
+			}
+			if expiry, okTTL := expiryFromMetadata(ravenMeta); okTTL {
+				if isExpired(expiry) {
+					resp = append(resp, missingBulkGetResponse(current.ID))
+					continue
+				}
+				meta[state.GetRespMetaKeyTTLExpireTime] = expiry.UTC().Format(time.RFC3339)
+			}
+		}
+
+		resp = append(resp, state.BulkGetResponse{
+			Key:      current.ID,
+			Data:     []byte(current.Value),
+			ETag:     &etagResp,
+			Metadata: meta,
+		})
 	}
 
 	return resp, nil
+}
+
+func missingBulkGetResponse(key string) state.BulkGetResponse {
+	return state.BulkGetResponse{
+		Key:      key,
+		Data:     nil,
+		ETag:     nil,
+		Metadata: make(map[string]string),
+	}
+}
+
+// expiryFromMetadata returns the expiration time recorded on a RavenDB document,
+// reporting false when the document has no usable @expires metadata.
+func expiryFromMetadata(ravenMeta *ravendb.MetadataAsDictionary) (time.Time, bool) {
+	raw, ok := ravenMeta.Get(expires)
+	if !ok {
+		return time.Time{}, false
+	}
+
+	str, ok := raw.(string)
+	if !ok {
+		return time.Time{}, false
+	}
+
+	expiry, err := time.Parse(time.RFC3339Nano, str)
+	if err != nil {
+		return time.Time{}, false
+	}
+
+	return expiry, true
+}
+
+// isExpired reports whether a document with the given expiration must no longer
+// be served. RavenDB removes expired documents on a background sweep, so a
+// document can stay readable well past its expiration; filtering on read keeps
+// TTL semantics independent of the sweep interval, which the server may refuse
+// to lower below a license-specific minimum.
+func isExpired(expiry time.Time) bool {
+	return !time.Now().UTC().Before(expiry)
 }
 
 func (r *RavenDB) marshalToString(v interface{}) (string, error) {
@@ -325,70 +462,86 @@ func (r *RavenDB) setInternal(ctx context.Context, req *state.SetRequest, sessio
 		Value: data,
 	}
 
-	if req.Options.Concurrency == state.FirstWrite {
-		// First write wins, we send empty change vector to check if exists
-
-		// current version of the go ravendb SDK doesn't let us check concurrency violation on items that are not in the database.
-		// we need to try to load, and do regullar save if item is not in DB (real first save)
-		// if we have item in DB we can try to override it with concurency check
-		var newItem *Item
-		err = session.Load(&newItem, req.Key)
-		if newItem == nil {
+	switch {
+	case req.HasETag():
+		// The server also rejects a missing document.
+		cv := *req.ETag
+		if req.Options.Concurrency == state.FirstWrite {
+			// First-write with an etag on a missing or expired document creates it.
+			var live bool
+			var expiredCV string
+			live, expiredCV, err = loadForWrite(session, req.Key)
+			if err != nil {
+				return err
+			}
+			if !live {
+				cv = expiredCV
+			}
+		}
+		if cv == "" {
 			err = session.Store(item)
 		} else {
-			var eTag string
-			if req.HasETag() {
-				eTag = *req.ETag
-			} else {
-				eTag = RandStringRunes(5)
-			}
-
-			if newItem.Value == item.Value {
-				return fmt.Errorf("error storing data: %s", err)
-			}
-			newItem.Value = item.Value
-			err = session.StoreWithChangeVectorAndID(newItem, eTag, req.Key)
+			err = session.StoreWithChangeVectorAndID(item, cv, req.Key)
+		}
+		if err != nil {
+			return fmt.Errorf("error storing data: %w", err)
+		}
+	case req.Options.Concurrency == state.FirstWrite:
+		var cv string
+		cv, err = r.checkMissing(session, req.Key)
+		if err != nil {
+			return err
+		}
+		if cv != "" {
+			err = session.StoreWithChangeVectorAndID(item, cv, req.Key)
+		} else {
+			err = session.Store(item)
 		}
 		if err != nil {
 			return fmt.Errorf("error storing data: %s", err)
 		}
-	} else {
-		// Last write wins
-		if req.HasETag() {
-			eTag := *req.ETag
-			err = session.StoreWithChangeVectorAndID(item, eTag, req.Key)
-			if err != nil {
-				return state.NewETagError(state.ETagMismatch, err)
-			}
-		} else {
-			err = session.Store(item)
-		}
-
+	default:
+		err = session.Store(item)
 		if err != nil {
 			return fmt.Errorf("error storing data: %s", err)
 		}
 	}
 
-	reqTTL, err := stateutils.ParseTTL(req.Metadata)
+	return r.applyTTL(session, item, req.Metadata)
+}
+
+// applyTTL records the expiration of a stored entity, or clears it when the
+// request asks for no TTL. A ttlInSeconds of -1 removes an existing expiration.
+func (r *RavenDB) applyTTL(session *ravendb.DocumentSession, entity any, reqMetadata map[string]string) error {
+	reqTTL, err := stateutils.ParseTTL(reqMetadata)
 	if err != nil {
 		return fmt.Errorf("failed to parse TTL: %w", err)
 	}
 
-	if reqTTL != nil {
-		metaData, err := session.Advanced().GetMetadataFor(item)
-		if err != nil {
-			return errors.New("failed to get metadata for item")
-		}
-		expiry := time.Now().Add(time.Second * time.Duration(*reqTTL)).UTC()
-		iso8601String := expiry.Format("2006-01-02T15:04:05.9999999Z07:00")
-		metaData.Put(expires, iso8601String)
+	metaData, err := session.Advanced().GetMetadataFor(entity)
+	if err != nil {
+		return fmt.Errorf("failed to get metadata for item: %w", err)
 	}
+
+	if reqTTL == nil || *reqTTL <= 0 {
+		if _, ok := metaData.Get(expires); ok {
+			// EntrySet materializes the server-provided metadata so that the
+			// removal is tracked and sent on save.
+			metaData.EntrySet()
+			metaData.Remove(expires)
+		}
+		return nil
+	}
+
+	expiry := time.Now().Add(time.Second * time.Duration(*reqTTL)).UTC()
+	metaData.Put(expires, expiry.Format(expiresLayout))
+
 	return nil
 }
 
 func (r *RavenDB) deleteInternal(ctx context.Context, req *state.DeleteRequest, session *ravendb.DocumentSession, fromTransaction bool) error {
 	var err error
-	if fromTransaction {
+	if fromTransaction && !req.HasETag() {
 		var itemToDelete *Item
 		err = session.Load(&itemToDelete, req.Key)
 		if err == nil && itemToDelete != nil {
@@ -446,37 +599,43 @@ func (r *RavenDB) Close() error {
 	return nil
 }
 
-func (r *RavenDB) initTTL() {
+func (r *RavenDB) initTTL() error {
 	configurationExpiration := ravendb.ExpirationConfiguration{
 		Disabled:             !r.metadata.EnableTTL,
 		DeleteFrequencyInSec: &r.metadata.TTLFrequency,
 	}
 	operation, err := ravendb.NewConfigureExpirationOperationWithConfiguration(&configurationExpiration)
 	if err != nil {
-		return
+		return fmt.Errorf("failed to create expiration configuration operation: %w", err)
 	}
-	err = r.documentStore.Maintenance().Send(operation)
-	if err != nil {
-		r.logger.Debug(err)
+
+	if err = r.documentStore.Maintenance().Send(operation); err != nil {
+		return fmt.Errorf("failed to configure expiration with a delete frequency of %ds: %w", r.metadata.TTLFrequency, err)
 	}
+
+	return nil
 }
 
-func (r *RavenDB) setupDatabase() {
+func (r *RavenDB) setupDatabase() error {
 	operation := ravendb.NewGetDatabaseRecordOperation(r.metadata.DatabaseName)
-	err := r.documentStore.Maintenance().Server().Send(operation)
-	if err == nil {
-		if operation.Command != nil && operation.Command.StatusCode == http.StatusNotFound {
-			databaseRecord := ravendb.DatabaseRecord{
-				DatabaseName: r.metadata.DatabaseName,
-				Disabled:     false,
-			}
-			createOp := ravendb.NewCreateDatabaseOperation(&databaseRecord, 1)
-			err = r.documentStore.Maintenance().Server().Send(createOp)
-			if err != nil {
-				return
-			}
-		}
+	if err := r.documentStore.Maintenance().Server().Send(operation); err != nil {
+		return fmt.Errorf("failed to load database record: %w", err)
 	}
+
+	if operation.Command == nil || operation.Command.StatusCode != http.StatusNotFound {
+		return nil
+	}
+
+	databaseRecord := ravendb.DatabaseRecord{
+		DatabaseName: r.metadata.DatabaseName,
+		Disabled:     false,
+	}
+	createOp := ravendb.NewCreateDatabaseOperation(&databaseRecord, 1)
+	if err := r.documentStore.Maintenance().Server().Send(createOp); err != nil {
+		return fmt.Errorf("failed to create database: %w", err)
+	}
+
+	return nil
 }
 
 func getRavenDBMetaData(meta state.Metadata) (RavenDBMetadata, error) {
@@ -502,19 +661,4 @@ func getRavenDBMetaData(meta state.Metadata) (RavenDBMetadata, error) {
 	}
 
 	return m, nil
-}
-
-func RandStringRunes(n int) string {
-	// Create a byte slice to hold the random bytes
-	bytes := make([]byte, n)
-
-	// Fill the byte slice with random bytes
-	_, err := rand.Read(bytes)
-	if err != nil {
-		return ""
-	}
-
-	// Encode the random bytes to a base64 string
-	// This will make it printable/usable as a string
-	return base64.URLEncoding.EncodeToString(bytes)[:n]
 }

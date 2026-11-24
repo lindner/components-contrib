@@ -458,3 +458,73 @@ metadata:
       A regular expression to exclude keys from being converted to/from headers from/to metadata to avoid unwanted downstream side effects.
     example: '"^rawPayload|valueSchemaType$"'
     default: '""'
+  - name: dialTimeout
+    type: duration
+    description: |
+      The maximum duration to wait for the initial TCP connection to a broker to be established. Bounds how long Init() can block on an unreachable cluster.
+    example: '"10s"'
+    default: '"30s"'
+  - name: readTimeout
+    type: duration
+    description: |
+      The maximum duration to wait for a response from a broker after sending a request.
+    example: '"10s"'
+    default: '"30s"'
+  - name: writeTimeout
+    type: duration
+    description: |
+      The maximum duration to wait for a request to be transmitted to a broker.
+    example: '"10s"'
+    default: '"30s"'
+  - name: metadataTimeout
+    type: duration
+    description: |
+      The per-request timeout for metadata refresh operations. When set to 0 (default) Sarama computes the effective timeout from the Net timeouts and retry count.
+    example: '"5s"'
+    default: '"0"'
+  - name: producerRequiredAcks
+    type: string
+    description: |
+      The number of partition replicas that must acknowledge a produce request before it is considered successful. Accepted values: "all" (wait for all in-sync replicas, highest durability), "local" (wait for the partition leader only), "none" (no acknowledgement required, lowest durability).
+    example: '"local"'
+    default: '"all"'
+  - name: producerRetryMax
+    type: number
+    description: |
+      The maximum number of times to retry sending a message before giving up.
+    example: '3'
+    default: '5'
+  - name: producerTransactionsEnabled
+    type: bool
+    description: |
+      When true, every publish is wrapped in a Kafka transaction on an idempotent producer: an aborted publish is never visible to consumers reading with "read_committed".
+      Requires producerRequiredAcks "all", producerRetryMax >= 1 and Kafka 0.11 or later. Transactions serialize publishes and add broker round trips, lowering publish throughput.
+      The producer's transactional.id gets a random per-instance suffix, so the guarantee is atomicity per publish; there is no transaction recovery or fencing across component restarts.
+    example: '"true"'
+    default: '"false"'
+  - name: transactionalIdPrefix
+    type: string
+    description: |
+      Prefix for the producer transactional.id when producerTransactionsEnabled is true. A random per-instance suffix is appended so scaled replicas never fence each other's transactions. Defaults to the client ID, then the consumer group, then "dapr".
+    example: '"my-app"'
+  - name: consumerIsolationLevel
+    type: string
+    description: |
+      Isolation level for consumers. "read_uncommitted" (default) delivers all records; "read_committed" hides records belonging to open or aborted Kafka transactions and requires Kafka 0.11 or later.
+    example: '"read_committed"'
+    default: '"read_uncommitted"'
+    allowedValues:
+      - "read_uncommitted"
+      - "read_committed"
+  - name: consumerTransactionsEnabled
+    type: bool
+    description: |
+      Not supported for the Kafka binding: setting it to true fails at init. Transactional consume-transform-produce requires the delivery's transaction token to be echoed back through the same component instance, which the bindings model (separate input and output binding instances) cannot provide. Use the Kafka pubsub component instead.
+    example: '"false"'
+    default: '"false"'
+  - name: transactionTimeout
+    type: duration
+    description: |
+      Transaction timeout requested from the broker when producerTransactionsEnabled is true. It must NOT exceed the broker's transaction.max.timeout.ms (15 minutes by default): the broker REJECTS larger values at producer initialization, which fails every publish.
+    example: '"90s"'
+    default: '"60s"'

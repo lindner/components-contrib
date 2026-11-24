@@ -47,11 +47,17 @@ type AWSBedrockMetadata struct {
 	SessionToken     string         `json:"sessionToken"`
 	Model            string         `json:"model"`
 	ResponseCacheTTL *time.Duration `json:"responseCacheTTL,omitempty" mapstructure:"responseCacheTTL" mapstructurealiases:"cacheTTL" mdaliases:"cacheTTL"`
+	// MaxTokens is a component-level default cap on the number of tokens the
+	// model may generate for every request; a request-level MaxTokens greater
+	// than zero overrides it. See conversation.LangchainMetadata.MaxTokens.
+	MaxTokens *int64 `json:"maxTokens,omitempty" mapstructure:"maxTokens"`
 
 	// TODO: @mikeee - Consider exporting awsCommonAuth.awsRAOpts and using it here
-	AssumeRoleArn   string `json:"assumeRoleArn"`
-	TrustAnchorArn  string `json:"trustAnchorArn"`
-	TrustProfileArn string `json:"trustProfileArn"`
+	AssumeRoleArn         string `json:"assumeRoleArn"`
+	AssumeRoleSessionName string `json:"assumeRoleSessionName"`
+	TrustAnchorArn        string `json:"trustAnchorArn"`
+	TrustProfileArn       string `json:"trustProfileArn"`
+	WebIdentityAudience   string `json:"webIdentityAudience"`
 }
 
 func NewAWSBedrock(logger logger.Logger) conversation.Conversation {
@@ -71,16 +77,18 @@ func (b *AWSBedrock) Init(ctx context.Context, meta conversation.Metadata) error
 	}
 
 	configOpts := awsCommonAuth.Options{
-		Logger:          b.logger,
-		Properties:      nil,
-		Region:          m.Region,
-		AccessKey:       m.AccessKey,
-		SecretKey:       m.SecretKey,
-		SessionToken:    m.SessionToken,
-		AssumeRoleArn:   m.AssumeRoleArn,
-		TrustAnchorArn:  m.TrustAnchorArn,
-		TrustProfileArn: m.TrustProfileArn,
-		Endpoint:        m.Endpoint,
+		Logger:                b.logger,
+		Properties:            meta.Properties,
+		Region:                m.Region,
+		AccessKey:             m.AccessKey,
+		SecretKey:             m.SecretKey,
+		SessionToken:          m.SessionToken,
+		AssumeRoleArn:         m.AssumeRoleArn,
+		AssumeRoleSessionName: m.AssumeRoleSessionName,
+		TrustAnchorArn:        m.TrustAnchorArn,
+		TrustProfileArn:       m.TrustProfileArn,
+		WebIdentityAudience:   m.WebIdentityAudience,
+		Endpoint:              m.Endpoint,
 	}
 
 	awsConfig, err := awsCommon.NewConfig(ctx, configOpts)
@@ -105,6 +113,7 @@ func (b *AWSBedrock) Init(ctx context.Context, meta conversation.Metadata) error
 
 	b.Model = llm
 	b.SetModel(b.model)
+	b.SetDefaultMaxTokens(m.MaxTokens)
 
 	if m.ResponseCacheTTL != nil {
 		cachedModel, cacheErr := conversation.CacheResponses(ctx, m.ResponseCacheTTL, b.Model)

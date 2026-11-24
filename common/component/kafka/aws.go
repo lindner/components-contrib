@@ -24,27 +24,27 @@ import (
 )
 
 type AwsClients struct {
-	config          *sarama.Config
-	consumerGroup   *string
-	brokers         *[]string
-	maxMessageBytes *int
+	config         *sarama.Config
+	consumerGroup  *string
+	brokers        *[]string
+	producerConfig ProducerConfig
 
 	ConsumerGroup sarama.ConsumerGroup
 	Producer      sarama.SyncProducer
 }
 type KafkaOptions struct {
-	Config          *sarama.Config
-	ConsumerGroup   string
-	Brokers         []string
-	MaxMessageBytes int
+	Config         *sarama.Config
+	ConsumerGroup  string
+	Brokers        []string
+	ProducerConfig ProducerConfig
 }
 
 func InitAwsClients(opts KafkaOptions) *AwsClients {
 	return &AwsClients{
-		config:          opts.Config,
-		consumerGroup:   &opts.ConsumerGroup,
-		brokers:         &opts.Brokers,
-		maxMessageBytes: &opts.MaxMessageBytes,
+		config:         opts.Config,
+		consumerGroup:  &opts.ConsumerGroup,
+		brokers:        &opts.Brokers,
+		producerConfig: opts.ProducerConfig,
 	}
 }
 
@@ -98,24 +98,12 @@ func (m *mskTokenProvider) Token() (*sarama.AccessToken, error) {
 }
 
 func (c *AwsClients) getSyncProducer() (sarama.SyncProducer, error) {
-	// Add SyncProducer specific properties to copy of base config
-	c.config.Producer.RequiredAcks = sarama.WaitForAll
-	c.config.Producer.Retry.Max = 5
-	c.config.Producer.Return.Successes = true
+	// Apply SyncProducer-specific properties to a COPY of the shared config so
+	// the consumer-group's view of the config is not mutated.
+	cfg := *c.config
+	applySyncProducerConfig(&cfg, c.producerConfig)
 
-	if *c.maxMessageBytes > 0 {
-		c.config.Producer.MaxMessageBytes = *c.maxMessageBytes
-	}
-
-	saramaClient, err := sarama.NewClient(*c.brokers, c.config)
-	if err != nil {
-		return nil, err
-	}
-
-	producer, err := sarama.NewSyncProducerFromClient(saramaClient)
-	if err != nil {
-		return nil, err
-	}
-
-	return producer, nil
+	// The producer must own its sarama client (see newOwnedSyncProducer): a
+	// caller-supplied client would never be closed and leak on recreation.
+	return newOwnedSyncProducer(*c.brokers, &cfg)
 }

@@ -60,9 +60,14 @@ func (h *Huggingface) Init(ctx context.Context, meta conversation.Metadata) erro
 		endpoint = m.Endpoint
 	}
 
+	headers, err := conversation.ParseHeaders(m.Headers)
+	if err != nil {
+		return err
+	}
+
 	// Create options for OpenAI client using HuggingFace's OpenAI-compatible API
 	// This is a workaround for issues with the native HuggingFace langchaingo implementation
-	options := conversation.BuildOpenAIClientOptions(model, m.Key, endpoint)
+	options := conversation.BuildOpenAIClientOptions(model, m.Key, endpoint, headers)
 
 	llm, err := openai.New(options...)
 	if err != nil {
@@ -71,6 +76,10 @@ func (h *Huggingface) Init(ctx context.Context, meta conversation.Metadata) erro
 
 	h.Model = llm
 	h.SetModel(model)
+	h.SetDefaultMaxTokens(m.MaxTokens)
+	// The Hugging Face router proxies many OpenAI-compatible backends that
+	// only honor the legacy max_tokens field, not max_completion_tokens.
+	h.SetPostCallOptions(openai.WithLegacyMaxTokensField())
 
 	if m.ResponseCacheTTL != nil {
 		cachedModel, cacheErr := conversation.CacheResponses(ctx, m.ResponseCacheTTL, h.Model)

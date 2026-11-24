@@ -64,8 +64,13 @@ func (o *Ollama) Init(ctx context.Context, meta conversation.Metadata) error {
 		md.Endpoint = defaultEndpoint
 	}
 
+	headers, err := conversation.ParseHeaders(md.Headers)
+	if err != nil {
+		return err
+	}
+
 	model := conversation.GetOllamaModel(md.Model)
-	options := conversation.BuildOpenAIClientOptions(model, md.Key, md.Endpoint)
+	options := conversation.BuildOpenAIClientOptions(model, md.Key, md.Endpoint, headers)
 	llm, err := openai.New(options...)
 	if err != nil {
 		return err
@@ -73,6 +78,11 @@ func (o *Ollama) Init(ctx context.Context, meta conversation.Metadata) error {
 
 	o.Model = llm
 	o.SetModel(model)
+	o.SetDefaultMaxTokens(md.MaxTokens)
+	// Ollama's OpenAI-compatible endpoint ignores the modern
+	// max_completion_tokens field (verified against ollama 0.32); only the
+	// legacy max_tokens field caps output.
+	o.SetPostCallOptions(openai.WithLegacyMaxTokensField())
 
 	if md.ResponseCacheTTL != nil {
 		cachedModel, cacheErr := conversation.CacheResponses(ctx, md.ResponseCacheTTL, o.Model)

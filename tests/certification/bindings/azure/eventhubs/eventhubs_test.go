@@ -15,10 +15,14 @@ package eventhubs_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -302,6 +306,11 @@ func TestEventhubBindingMultiplePartition(t *testing.T) {
 
 	received := watcher.NewUnordered()
 
+	// The hub and consumer group are shared with other tests and runs, and the
+	// component starts from the earliest event when no checkpoint exists. Tag
+	// this run's messages so the handler can skip events it did not send.
+	runSuffix := ", run: " + uuid.NewString()
+
 	metadata0 := map[string]string{
 		messageKey: partition0,
 	}
@@ -322,7 +331,7 @@ func TestEventhubBindingMultiplePartition(t *testing.T) {
 			} else {
 				md = metadata1
 			}
-			outputmsg[i] = fmt.Sprintf("output binding: Message %d, partitionkey: %s", i, md[messageKey])
+			outputmsg[i] = fmt.Sprintf("output binding: Message %d, partitionkey: %s%s", i, md[messageKey], runSuffix)
 		}
 		received.ExpectStrings(outputmsg...)
 
@@ -359,6 +368,9 @@ func TestEventhubBindingMultiplePartition(t *testing.T) {
 		sim := simulate.PeriodicError(ctx, 100)
 		// Setup the binding endpoints
 		err = s.AddBindingInvocationHandler("azure-partitioned-binding", func(_ context.Context, in *common.BindingEvent) ([]byte, error) {
+			if !strings.HasSuffix(string(in.Data), runSuffix) {
+				return []byte("{}"), nil
+			}
 			if err := sim(); err != nil {
 				return nil, err
 			}
@@ -391,6 +403,78 @@ func TestEventhubBindingMultiplePartition(t *testing.T) {
 		Step("send and wait", sendAndReceive).
 		Step("delete containers", deleteEventhub).
 		Step("wait", flow.Sleep(5*time.Second)).
+		Run()
+}
+
+func TestEventhubBindingRedeliversAfterFailedHandlerAndRestart(t *testing.T) {
+	ports, _ := dapr_testing.GetFreePorts(3)
+	grpcPort := ports[0]
+	httpPort := ports[1]
+	redeliveryAppPort := ports[2]
+	message := "redelivery-" + uuid.NewString()
+	received := watcher.NewUnordered()
+	received.ExpectStrings(message)
+	firstFailure := make(chan struct{})
+	var firstFailureOnce sync.Once
+	var accept atomic.Bool
+
+	application := func(_ flow.Context, s common.Service) error {
+		return s.AddBindingInvocationHandler("azure-single-partition-binding", func(_ context.Context, event *common.BindingEvent) ([]byte, error) {
+			if string(event.Data) == message && !accept.Load() {
+				firstFailureOnce.Do(func() { close(firstFailure) })
+				return nil, errors.New("intentional certification failure")
+			}
+			received.Observe(string(event.Data))
+			return []byte("{}"), nil
+		})
+	}
+
+	sidecarOptions := func() []embedded.Option {
+		return append(componentRuntimeOptions(),
+			embedded.WithComponentsPath("./components/binding/consumer1"),
+			embedded.WithAppProtocol(protocol.HTTPProtocol, strconv.Itoa(redeliveryAppPort)),
+			embedded.WithDaprGRPCPort(strconv.Itoa(grpcPort)),
+			embedded.WithDaprHTTPPort(strconv.Itoa(httpPort)),
+		)
+	}
+	deleteEventhub := func(ctx flow.Context) error {
+		output, err := exec.Command("/bin/sh", "deleteeventhub.sh", "eventhubs-bindings-container-c1").Output()
+		require.NoErrorf(ctx, err, "Error in deleteeventhub.sh.:\n%s", string(output))
+		return nil
+	}
+
+	flow.New(t, "eventhubs binding redelivery after restart").
+		Step(app.Run("redelivery-app", fmt.Sprintf(":%d", redeliveryAppPort), application)).
+		Step(sidecar.Run("redelivery-sidecar", sidecarOptions()...)).
+		Step("publish message that fails", func(ctx flow.Context) error {
+			client, err := dapr.NewClientWithPort(strconv.Itoa(grpcPort))
+			require.NoError(ctx, err)
+			defer client.Close()
+			err = client.InvokeOutputBinding(ctx, &dapr.InvokeBindingRequest{
+				Name:      "azure-single-partition-binding",
+				Operation: "create",
+				Data:      []byte(message),
+				Metadata:  map[string]string{messageKey: "redelivery"},
+			})
+			require.NoError(ctx, err)
+			select {
+			case <-firstFailure:
+				return nil
+			case <-time.After(time.Minute):
+				return errors.New("timed out waiting for intentional handler failure")
+			}
+		}).
+		Step("stop sidecar before handler succeeds", sidecar.Stop("redelivery-sidecar")).
+		Step("allow handler success", func(flow.Context) error {
+			accept.Store(true)
+			return nil
+		}).
+		Step(sidecar.Run("redelivery-sidecar", sidecarOptions()...)).
+		Step("verify failed message is redelivered", func(ctx flow.Context) error {
+			received.Assert(ctx, time.Minute)
+			return nil
+		}).
+		Step("delete container", deleteEventhub).
 		Run()
 }
 

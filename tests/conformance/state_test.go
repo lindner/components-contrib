@@ -83,6 +83,10 @@ func loadStateStore(name string) state.Store {
 		return s_redis.NewRedisStateStore(testLogger)
 	case "redis.v7":
 		return s_redis.NewRedisStateStore(testLogger)
+	case "redis.valkey8":
+		return s_redis.NewRedisStateStore(testLogger)
+	case "redis.valkey9":
+		return s_redis.NewRedisStateStore(testLogger)
 	case "azure.blobstorage.v1":
 		return s_blobstorage_v1.NewAzureBlobStorageStore(testLogger)
 	case "azure.blobstorage.v2":
@@ -140,6 +144,8 @@ func loadStateStore(name string) state.Store {
 	case "aws.dynamodb.docker":
 		return s_awsdynamodb.NewDynamoDBStateStore(testLogger)
 	case "aws.dynamodb.terraform":
+		return s_awsdynamodb.NewDynamoDBStateStore(testLogger)
+	case "aws-floci.dynamodb":
 		return s_awsdynamodb.NewDynamoDBStateStore(testLogger)
 	case "etcd.v1":
 		return s_etcd.NewEtcdStateStoreV1(testLogger)

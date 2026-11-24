@@ -76,6 +76,10 @@ func loadOutputBindings(name string) bindings.OutputBinding {
 		return b_redis.NewRedis(testLogger)
 	case "redis.v7":
 		return b_redis.NewRedis(testLogger)
+	case "redis.valkey8":
+		return b_redis.NewRedis(testLogger)
+	case "redis.valkey9":
+		return b_redis.NewRedis(testLogger)
 	case "azure.blobstorage":
 		return b_azure_blobstorage.NewAzureBlobStorage(testLogger)
 	case "azure.storagequeues":
@@ -107,6 +111,8 @@ func loadOutputBindings(name string) bindings.OutputBinding {
 	case "aws.s3.docker":
 		return b_aws_s3.NewAWSS3(testLogger)
 	case "aws.s3.terraform":
+		return b_aws_s3.NewAWSS3(testLogger)
+	case "aws-floci.s3":
 		return b_aws_s3.NewAWSS3(testLogger)
 	default:
 		return nil
